@@ -13,7 +13,17 @@ cp .env.example .env
 .venv/bin/python monarch.py
 ```
 
-The first successful login writes `.mm/mm_session.pickle` and `.mm/device_uuid`. Later runs reuse that session. A new device is asked for the email code before the authenticator code. `MONARCH_MFA_SECRET` covers the authenticator code. `MONARCH_EMAIL_OTP` is the one-time email code. If password login is blocked, set `MONARCH_COOKIE` to a browser `Cookie` header that includes `session_id` and `csrftoken`.
+## Authentication
+
+The script reads `MONARCH_EMAIL`, `MONARCH_PASSWORD`, `MONARCH_MFA_SECRET`, `MONARCH_EMAIL_OTP`, and `MONARCH_COOKIE` from the process environment. A `.env` file is optional. `load_env_file` uses `setdefault`, so a value already in the environment wins over `.env`. A job can inject the variables at runtime and skip the file.
+
+`MONARCH_EMAIL` and `MONARCH_PASSWORD` cover the password login. `MONARCH_MFA_SECRET` is the TOTP secret; the script turns it into the current authenticator code with `oathtool`. If either the email or the password is missing, the script prompts on the terminal. A job has no terminal, so both must be set whenever a login runs.
+
+A new device is asked for a one-time email code before the authenticator code. Without `MONARCH_EMAIL_OTP`, the script reads that code from the terminal and the job stops. Set `MONARCH_EMAIL_OTP` for that one run. If Monarch returns a CAPTCHA, password login stops. Set `MONARCH_COOKIE` to a browser `Cookie` header that includes `session_id` and `csrftoken`.
+
+The first successful login writes `.mm/mm_session.pickle` and `.mm/device_uuid`. The token is bound to that device id. Later runs load the pickle and do not use the email, password, or MFA secret. The job must keep the `.mm/` directory between runs. A fresh disk is a new device, and Monarch asks for the email code again.
+
+If Monarch rejects the saved session, the script deletes the pickle and logs in again. That attempt needs the email, password, and MFA secret, and it needs `MONARCH_EMAIL_OTP` again when Monarch asks for the email code.
 
 ## Secrets
 
