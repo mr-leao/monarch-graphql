@@ -1,5 +1,6 @@
 .venv/
 .env
 .mm/
+export/
 __pycache__/
 *.pyc

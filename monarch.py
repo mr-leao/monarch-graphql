@@ -18,22 +18,46 @@ A new device is asked for the email code before the authenticator code.
 The first successful login is saved to .mm/mm_session.pickle and reused.
 If you sign in to Monarch with Google, set a password under Settings > Security
 before running this.
+
+With no date arguments, transactions cover the current calendar month, the
+same period as the budget. Pass both bounds for a different range:
+
+    python monarch.py --start 2026-07-17 --end 2026-10-16
+    python monarch.py --start 2026-07-17T00:00:00 --end 2026-10-16T23:59:59
+
+Monarch stores a calendar date on each transaction. A time in either bound
+is accepted and the calendar date of that value is what the query uses.
+
+Pass --recurring to also list every recurring stream, including bills with
+no charge in the transaction window:
+
+    python monarch.py --recurring
+
+    python monarch.py --format json
+    python monarch.py --format csv --output-dir export --recurring
+
+text is the default. json prints one document. csv writes one file per
+section: accounts, net worth, budget totals, categories, goals, and
+transactions. recurring.csv is written only with --recurring.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import calendar
+import csv
 import getpass
 import json
 import os
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from uuid import uuid4
 
 import oathtool
 from aiohttp import ClientSession
+from gql import gql
 from monarchmoney import CaptchaRequiredException, LoginFailedException, MonarchMoney
 from monarchmoney.monarchmoney import MonarchMoneyEndpoints
 
@@ -44,6 +68,34 @@ ENV_FILE = ROOT / ".env"
 # Captured from the Monarch web app. Login returns a structured error rather
 # than "app update required" with this value.
 CLIENT_VERSION = "v1.0.1668"
+TRANSACTION_PAGE_SIZE = 100
+RECURRING_QUERY = gql(
+    """
+    query Recurring($includeLiabilities: Boolean, $includePending: Boolean) {
+      recurringTransactionStreams(
+        includeLiabilities: $includeLiabilities
+        includePending: $includePending
+      ) {
+        stream {
+          id
+          name
+          frequency
+          amount
+          isActive
+          isApproximate
+          recurringType
+          reviewStatus
+          baseDate
+          merchant { id name }
+          creditReportLiabilityAccount { id name liabilityType }
+        }
+        account { id displayName }
+        category { id name }
+        nextForecastedTransaction { date amount }
+      }
+    }
+    """
+)
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -271,12 +323,410 @@ def current_month_range() -> tuple[str, str, str]:
     return start, end, today.strftime("%Y-%m")
 
 
-async def fetch(mm: MonarchMoney) -> tuple[dict, dict, dict]:
-    start, end, _month = current_month_range()
+def parse_range_bound(value: str) -> datetime:
+    """Parse a calendar date or an ISO-8601 datetime."""
+    text = value.strip()
+    date_only = "T" not in text and " " not in text
+    try:
+        if date_only:
+            day = date.fromisoformat(text)
+            return datetime(day.year, day.month, day.day)
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "use YYYY-MM-DD or an ISO-8601 datetime, for example 2026-07-17T15:30:00"
+        ) from exc
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Print Monarch Money accounts, net worth, the current budget, and transactions. "
+            "Transactions default to the current calendar month."
+        )
+    )
+    parser.add_argument(
+        "--start",
+        type=parse_range_bound,
+        metavar="DATETIME",
+        help=(
+            "Include transactions on or after this date. "
+            "YYYY-MM-DD or an ISO-8601 datetime. Must be passed with --end. "
+            "Defaults to the first day of the current month."
+        ),
+    )
+    parser.add_argument(
+        "--end",
+        type=parse_range_bound,
+        metavar="DATETIME",
+        help=(
+            "Include transactions on or before this date. "
+            "YYYY-MM-DD or an ISO-8601 datetime. Must be passed with --start. "
+            "Defaults to the last day of the current month."
+        ),
+    )
+    parser.add_argument(
+        "--recurring",
+        action="store_true",
+        help=(
+            "Also list every recurring stream Monarch has on file, "
+            "including pending ones and credit-report liabilities. "
+            "This is not limited to the transaction date range."
+        ),
+    )
+    parser.add_argument(
+        "--format",
+        choices=("text", "json", "csv"),
+        default="text",
+        help=(
+            "text prints the report. json prints one document on standard output. "
+            "csv writes one file per section."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Directory for CSV files. Used with --format csv. Default: export/ next to this script.",
+    )
+    args = parser.parse_args(argv)
+    if args.output_dir is not None and args.format != "csv":
+        parser.error("--output-dir is only used with --format csv")
+    if (args.start is None) != (args.end is None):
+        parser.error("pass both --start and --end")
+    if args.start is None:
+        start, end, _month = current_month_range()
+        args.start = parse_range_bound(start)
+        args.end = parse_range_bound(end)
+    elif args.start.date() > args.end.date():
+        parser.error("--start must be on or before --end")
+    return args
+
+
+def transaction_day(txn: dict) -> date | None:
+    raw = txn.get("date")
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(str(raw)[:10])
+    except ValueError:
+        return None
+
+
+async def get_transactions_in_range(mm: MonarchMoney, start: date, end: date) -> dict:
+    """Return every transaction whose calendar date falls in start..end, inclusive."""
+    results: list[dict] = []
+    offset = 0
+    total: int | None = None
+    while True:
+        page = await mm.get_transactions(
+            limit=TRANSACTION_PAGE_SIZE,
+            offset=offset,
+            start_date=start.isoformat(),
+            end_date=end.isoformat(),
+        )
+        bucket = page.get("allTransactions") or {}
+        chunk = bucket.get("results") or []
+        if total is None and bucket.get("totalCount") is not None:
+            total = int(bucket["totalCount"])
+        results.extend(chunk)
+        offset += len(chunk)
+        if not chunk or len(chunk) < TRANSACTION_PAGE_SIZE or (total is not None and offset >= total):
+            break
+
+    kept = [txn for txn in results if (day := transaction_day(txn)) is not None and start <= day <= end]
+    kept.sort(key=lambda txn: (txn.get("date") or "", txn.get("createdAt") or ""), reverse=True)
+    return {"allTransactions": {"results": kept, "totalCount": len(kept)}}
+
+
+async def get_recurring_streams(mm: MonarchMoney) -> list[dict]:
+    """Return every recurring stream, not only occurrences inside a date window."""
+    payload = await mm.gql_call(
+        operation="Recurring",
+        graphql_query=RECURRING_QUERY,
+        variables={"includeLiabilities": True, "includePending": True},
+    )
+    rows = list(payload.get("recurringTransactionStreams") or [])
+    rows.sort(key=lambda row: (0 if (row.get("stream") or {}).get("isActive") else 1, recurring_name(row).lower()))
+    return rows
+
+
+def recurring_name(row: dict) -> str:
+    stream = row.get("stream") or {}
+    merchant = (stream.get("merchant") or {}).get("name")
+    liability = (stream.get("creditReportLiabilityAccount") or {}).get("name")
+    return stream.get("name") or merchant or liability or "Recurring"
+
+
+async def fetch(
+    mm: MonarchMoney,
+    start: datetime,
+    end: datetime,
+    include_recurring: bool = False,
+) -> tuple[dict, dict, dict, list[dict] | None]:
+    month_start, month_end, _month = current_month_range()
     accounts = await mm.get_accounts()
-    transactions = await mm.get_transactions(limit=10)
-    budgets = await mm.get_budgets(start_date=start, end_date=end)
-    return accounts, transactions, budgets
+    transactions = await get_transactions_in_range(mm, start.date(), end.date())
+    budgets = await mm.get_budgets(start_date=month_start, end_date=month_end)
+    recurring = await get_recurring_streams(mm) if include_recurring else None
+    return accounts, transactions, budgets, recurring
+
+
+def number(value: float | int | None) -> float | None:
+    if value is None:
+        return None
+    return round(float(value), 2)
+
+
+def account_report(payload: dict) -> tuple[list[dict], float]:
+    accounts = [
+        account
+        for account in payload.get("accounts", [])
+        if not account.get("isHidden") and not account.get("deactivatedAt")
+    ]
+    accounts.sort(
+        key=lambda account: (
+            ((account.get("type") or {}).get("display") or ""),
+            account.get("displayName") or "",
+        )
+    )
+    rows = []
+    net_worth = 0.0
+    for account in accounts:
+        amount = balance_of(account)
+        included = bool(account.get("includeInNetWorth", True))
+        if included:
+            net_worth += amount
+        rows.append(
+            {
+                "type": (account.get("type") or {}).get("display") or "Other",
+                "name": account.get("displayName") or "Unnamed",
+                "balance": number(amount),
+                "subtype": (account.get("subtype") or {}).get("display") or "",
+                "institution": (account.get("institution") or {}).get("name") or "",
+                "include_in_net_worth": included,
+            }
+        )
+    return rows, number(net_worth) or 0.0
+
+
+def budget_report(payload: dict) -> dict:
+    _start, _end, month = current_month_range()
+    budget_data = payload.get("budgetData") or {}
+    groups = payload.get("categoryGroups") or []
+    totals_row = month_row(budget_data.get("totalsByMonth"), month) or {}
+    totals = []
+    for label, key in (
+        ("Income", "totalIncome"),
+        ("Expenses", "totalExpenses"),
+        ("Fixed", "totalFixedExpenses"),
+        ("Flexible", "totalFlexibleExpenses"),
+        ("Non-monthly", "totalNonMonthlyExpenses"),
+    ):
+        block = totals_row.get(key) or {}
+        totals.append(
+            {
+                "month": month,
+                "name": label,
+                "budget": number(block.get("plannedAmount")),
+                "actual": number(block.get("actualAmount")),
+                "left": number(block.get("remainingAmount")),
+            }
+        )
+
+    amounts_by_category = {
+        (row.get("category") or {}).get("id"): month_row(row.get("monthlyAmounts"), month)
+        for row in budget_data.get("monthlyAmountsByCategory") or []
+    }
+    categories = []
+    ordered_groups = sorted(groups, key=lambda group: (group.get("type") != "income", group.get("order") or 0))
+    for group in ordered_groups:
+        group_name = group.get("name") or "Other"
+        for category in sorted(group.get("categories") or [], key=lambda item: item.get("order") or 0):
+            amounts = amounts_by_category.get(category["id"]) or {}
+            planned = signed(amounts.get("plannedCashFlowAmount")) + signed(amounts.get("plannedSetAsideAmount"))
+            actual = signed(amounts.get("actualAmount"))
+            remaining = signed(amounts.get("remainingAmount"))
+            if planned == 0 and actual == 0 and remaining == 0:
+                continue
+            categories.append(
+                {
+                    "month": month,
+                    "group": group_name,
+                    "category": category.get("name") or "Unnamed",
+                    "budget": number(planned),
+                    "actual": number(actual),
+                    "left": number(remaining),
+                }
+            )
+
+    goals = []
+    for goal in payload.get("goalsV2") or []:
+        if goal.get("archivedAt") or goal.get("completedAt"):
+            continue
+        planned = sum(
+            signed(row.get("amount"))
+            for row in goal.get("plannedContributions") or []
+            if str(row.get("month") or "").startswith(month)
+        )
+        contributed = sum(
+            signed(row.get("sum"))
+            for row in goal.get("monthlyContributionSummaries") or []
+            if str(row.get("month") or "").startswith(month)
+        )
+        if planned == 0 and contributed == 0:
+            continue
+        goals.append(
+            {
+                "month": month,
+                "name": goal.get("name") or "Goal",
+                "planned": number(planned),
+                "contributed": number(contributed),
+            }
+        )
+    return {"month": month, "totals": totals, "categories": categories, "goals": goals}
+
+
+def transaction_rows(payload: dict) -> list[dict]:
+    results = (payload.get("allTransactions") or {}).get("results") or []
+    rows = []
+    for txn in results:
+        merchant = (txn.get("merchant") or {}).get("name") or txn.get("plaidName") or None
+        rows.append(
+            {
+                "date": txn.get("date") or "",
+                "merchant": merchant,
+                "amount": number(txn.get("amount")),
+                "pending": bool(txn.get("pending")),
+                "category": (txn.get("category") or {}).get("name") or "",
+                "account": (txn.get("account") or {}).get("displayName") or "",
+            }
+        )
+    return rows
+
+
+def recurring_rows(rows: list[dict]) -> list[dict]:
+    exported = []
+    for row in rows:
+        stream = row.get("stream") or {}
+        amount = stream.get("amount")
+        next_txn = row.get("nextForecastedTransaction") or {}
+        if amount is None:
+            amount = next_txn.get("amount")
+        exported.append(
+            {
+                "name": recurring_name(row),
+                "frequency": stream.get("frequency") or "",
+                "amount": number(amount),
+                "next_date": next_txn.get("date") or "",
+                "active": bool(stream.get("isActive")),
+                "review_status": stream.get("reviewStatus") or "",
+                "type": stream.get("recurringType") or "",
+                "approximate": bool(stream.get("isApproximate")),
+                "category": (row.get("category") or {}).get("name") or "",
+                "account": (row.get("account") or {}).get("displayName") or "",
+            }
+        )
+    return exported
+
+
+def build_report(
+    accounts: dict,
+    budgets: dict,
+    transactions: dict,
+    start: datetime,
+    end: datetime,
+    recurring: list[dict] | None,
+) -> dict:
+    account_rows, net_worth = account_report(accounts)
+    report = {
+        "accounts": account_rows,
+        "net_worth": net_worth,
+        "budget": budget_report(budgets),
+        "transactions": {
+            "start": start.date().isoformat(),
+            "end": end.date().isoformat(),
+            "items": transaction_rows(transactions),
+        },
+    }
+    if recurring is not None:
+        report["recurring"] = recurring_rows(recurring)
+    return report
+
+
+def csv_value(value: object) -> object:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return value
+
+
+def write_csv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: csv_value(row.get(key)) for key in fieldnames})
+
+
+CSV_FILES = (
+    ("accounts.csv", "accounts", ("type", "name", "balance", "subtype", "institution", "include_in_net_worth")),
+    ("budget_totals.csv", ("budget", "totals"), ("month", "name", "budget", "actual", "left")),
+    ("categories.csv", ("budget", "categories"), ("month", "group", "category", "budget", "actual", "left")),
+    ("goals.csv", ("budget", "goals"), ("month", "name", "planned", "contributed")),
+    ("transactions.csv", ("transactions", "items"), ("date", "merchant", "amount", "pending", "category", "account")),
+    (
+        "recurring.csv",
+        "recurring",
+        (
+            "name",
+            "frequency",
+            "amount",
+            "next_date",
+            "active",
+            "review_status",
+            "type",
+            "approximate",
+            "category",
+            "account",
+        ),
+    ),
+)
+
+
+def report_section(report: dict, path: str | tuple[str, str]) -> list[dict] | None:
+    if isinstance(path, str):
+        if path not in report:
+            return None
+        return report[path]
+    parent, child = path
+    return report[parent][child]
+
+
+def write_csv_report(directory: Path, report: dict) -> list[Path]:
+    directory.mkdir(parents=True, exist_ok=True)
+    written = []
+    net_worth_path = directory / "net_worth.csv"
+    write_csv(net_worth_path, [{"net_worth": report["net_worth"]}], ["net_worth"])
+    written.append(net_worth_path)
+    for filename, section, fieldnames in CSV_FILES:
+        rows = report_section(report, section)
+        if rows is None:
+            continue
+        path = directory / filename
+        write_csv(path, rows, list(fieldnames))
+        written.append(path)
+    return written
+
+
+def emit_json(report: dict) -> None:
+    json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def emit_csv(report: dict, directory: Path) -> None:
+    for path in write_csv_report(directory, report):
+        print(path, file=sys.stderr)
 
 
 def print_accounts(payload: dict) -> None:
@@ -406,10 +856,11 @@ def print_budget(payload: dict) -> None:
             print(f"  {name:<32} planned {money(planned):>12}  contributed {money(contributed):>12}")
 
 
-def print_transactions(payload: dict) -> None:
+def print_transactions(payload: dict, start: datetime, end: datetime) -> None:
     results = (payload.get("allTransactions") or {}).get("results") or []
-    print("\nRecent transactions")
-    print("-------------------")
+    title = f"Transactions {start.date().isoformat()} to {end.date().isoformat()}"
+    print(f"\n{title}")
+    print("-" * len(title))
     if not results:
         print("  none")
         return
@@ -426,11 +877,51 @@ def print_transactions(payload: dict) -> None:
         )
 
 
-async def main() -> None:
+def print_recurring(rows: list[dict]) -> None:
+    print("\nRecurring")
+    print("---------")
+    if not rows:
+        print("  none")
+        return
+    for row in rows:
+        stream = row.get("stream") or {}
+        amount = stream.get("amount")
+        next_txn = row.get("nextForecastedTransaction") or {}
+        if amount is None:
+            amount = next_txn.get("amount")
+        category = (row.get("category") or {}).get("name") or ""
+        account = (row.get("account") or {}).get("displayName") or ""
+        extra = " · ".join(part for part in (category, account) if part)
+        suffix = f"  ({extra})" if extra else ""
+        flags: list[str] = []
+        if not stream.get("isActive"):
+            flags.append("inactive")
+        review = stream.get("reviewStatus")
+        if review and review != "approved":
+            flags.append(str(review))
+        kind = stream.get("recurringType")
+        if kind and kind != "expense":
+            flags.append(str(kind))
+        if stream.get("isApproximate"):
+            flags.append("approximate")
+        flag_text = f"  [{', '.join(flags)}]" if flags else ""
+        next_date = next_txn.get("date") or ""
+        next_text = f"  next {next_date}" if next_date else ""
+        frequency = stream.get("frequency") or ""
+        print(
+            f"  {recurring_name(row):<32} {frequency:<10} "
+            f"{money(amount):>14}{next_text}{flag_text}{suffix}"
+        )
+
+
+async def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     load_env_file(ENV_FILE)
     mm = await connect()
     try:
-        accounts, transactions, budgets = await fetch(mm)
+        accounts, transactions, budgets, recurring = await fetch(
+            mm, args.start, args.end, args.recurring
+        )
     except (LoginFailedException, CaptchaRequiredException):
         raise
     except Exception:
@@ -442,11 +933,23 @@ async def main() -> None:
         await login(mm)
         if SESSION_FILE.exists():
             SESSION_FILE.chmod(0o600)
-        accounts, transactions, budgets = await fetch(mm)
+        accounts, transactions, budgets, recurring = await fetch(
+            mm, args.start, args.end, args.recurring
+        )
 
-    print_accounts(accounts)
-    print_budget(budgets)
-    print_transactions(transactions)
+    if args.format == "text":
+        print_accounts(accounts)
+        print_budget(budgets)
+        print_transactions(transactions, args.start, args.end)
+        if recurring is not None:
+            print_recurring(recurring)
+        return
+
+    report = build_report(accounts, budgets, transactions, args.start, args.end, recurring)
+    if args.format == "json":
+        emit_json(report)
+        return
+    emit_csv(report, args.output_dir or (ROOT / "export"))
 
 
 if __name__ == "__main__":
