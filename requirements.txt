@@ -1,0 +1,5 @@
+# Python client used by https://github.com/sanghviharshit/ha-monarchmoney
+# That repo is a Home Assistant integration. Its manifest depends on this
+# package (imported as `monarchmoney`). 1.6.0 is newer than the integration's
+# pin of 1.5.1 and includes the current Monarch API host.
+monarchmoneycommunity==1.6.0
